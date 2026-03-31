@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Don't commit personal paths or processed state
+processed.json
+config.yaml
+
+# macOS
+.DS_Store
