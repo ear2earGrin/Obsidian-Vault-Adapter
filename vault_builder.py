@@ -400,42 +400,30 @@ def extract(path: Path) -> ExtractedDoc:
 
 
 def _reconstruct_messages(mapping: dict) -> list[dict]:
-    """Walk the conversation tree and return messages in order."""
-    # Find root node (no parent, or parent not in mapping)
-    root_id = None
-    for node_id, node in mapping.items():
-        parent = node.get("parent")
-        if parent is None or parent not in mapping:
-            root_id = node_id
-            break
-
-    if root_id is None:
-        return []
-
+    """Extract all messages from the mapping and sort by timestamp."""
     messages: list[dict] = []
 
-    def traverse(node_id: str) -> None:
-        node = mapping.get(node_id)
-        if not node:
-            return
+    for node in mapping.values():
         msg = node.get("message")
-        if msg:
-            role = msg.get("author", {}).get("role", "")
-            content = msg.get("content", {})
-            parts = content.get("parts", [])
-            # Only keep plain text parts (skip image/tool blocks)
-            text = "\n".join(str(p) for p in parts if isinstance(p, str)).strip()
-            if text and role in ("user", "assistant"):
-                messages.append({
-                    "role": role,
-                    "text": text,
-                    "time": msg.get("create_time"),
-                    "model": msg.get("metadata", {}).get("model_slug", ""),
-                })
-        for child_id in node.get("children", []):
-            traverse(child_id)
+        if not msg:
+            continue
+        role = msg.get("author", {}).get("role", "")
+        if role not in ("user", "assistant"):
+            continue
+        content = msg.get("content", {})
+        parts = content.get("parts", [])
+        text = "\n".join(str(p) for p in parts if isinstance(p, str)).strip()
+        if not text:
+            continue
+        messages.append({
+            "role": role,
+            "text": text,
+            "time": msg.get("create_time") or 0,
+            "model": msg.get("metadata", {}).get("model_slug", ""),
+        })
 
-    traverse(root_id)
+    # Sort chronologically — handles any tree depth without recursion
+    messages.sort(key=lambda m: m["time"])
     return messages
 
 
@@ -579,17 +567,62 @@ def call_lm_studio(excerpt: str, title: str, word_count: int, cfg: dict) -> dict
     }
 
 
+def call_claude_api(excerpt: str, title: str, word_count: int, cfg: dict) -> dict:
+    api_key = cfg.get("claude_api_key", "")
+    model = cfg.get("claude_model", "claude-haiku-4-5-20251001")
+    prompt = ENRICHMENT_PROMPT.format(title=title, word_count=word_count, excerpt=excerpt)
+
+    for attempt in range(1, 4):
+        try:
+            resp = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "max_tokens": 512,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=60,
+            )
+            resp.raise_for_status()
+            content = resp.json()["content"][0]["text"].strip()
+            content = re.sub(r"^```(?:json)?\s*", "", content)
+            content = re.sub(r"\s*```$", "", content)
+            return json.loads(content)
+
+        except (requests.RequestException, json.JSONDecodeError, KeyError) as exc:
+            log.warning(f"Claude API attempt {attempt}/3 failed: {exc}")
+            if attempt < 3:
+                time.sleep(2)
+
+    log.error("All Claude API retries exhausted. Using empty enrichment.")
+    return {"summary": "", "tags": [], "inferred_title": title, "key_concepts": []}
+
+
 def enrich(doc: ExtractedDoc, cfg: dict) -> EnrichedDoc:
     word_limit = cfg["enrichment_word_limit"]
     words = doc.raw_text.split()
     excerpt = " ".join(words[:word_limit])
 
-    result = call_lm_studio(
-        excerpt=excerpt,
-        title=doc.title,
-        word_count=min(len(words), word_limit),
-        cfg=cfg,
-    )
+    backend = cfg.get("backend", "lm_studio")
+    if backend == "claude":
+        result = call_claude_api(
+            excerpt=excerpt,
+            title=doc.title,
+            word_count=min(len(words), word_limit),
+            cfg=cfg,
+        )
+    else:
+        result = call_lm_studio(
+            excerpt=excerpt,
+            title=doc.title,
+            word_count=min(len(words), word_limit),
+            cfg=cfg,
+        )
 
     return EnrichedDoc(
         extracted=doc,

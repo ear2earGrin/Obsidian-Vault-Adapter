@@ -286,14 +286,43 @@
       <input id="vault_path" type="text" placeholder="/Users/you/ObsidianVault" />
     </div>
 
-    <div class="row">
-      <div class="field">
-        <label>LM Studio model name</label>
-        <input id="model" type="text" placeholder="qwen3" />
+    <!-- Backend selector -->
+    <div class="field">
+      <label>Enrichment backend</label>
+      <div style="display:flex;gap:0.5rem;margin-top:0.3rem;">
+        <button id="btn-lm" onclick="setBackend('lm_studio')" style="flex:1;background:var(--accent);color:#fff;font-size:0.8rem;padding:0.4rem 0.8rem;border-radius:6px;">Local (LM Studio)</button>
+        <button id="btn-claude" onclick="setBackend('claude')" style="flex:1;background:var(--border);color:var(--text-dim);font-size:0.8rem;padding:0.4rem 0.8rem;border-radius:6px;">Claude API</button>
       </div>
-      <div class="field">
-        <label>LM Studio endpoint</label>
-        <input id="endpoint" type="text" placeholder="http://localhost:1234/v1/chat/completions" />
+    </div>
+
+    <!-- LM Studio fields -->
+    <div id="backend-lm">
+      <div class="row">
+        <div class="field">
+          <label>LM Studio model name</label>
+          <input id="model" type="text" placeholder="qwen3" />
+        </div>
+        <div class="field">
+          <label>LM Studio endpoint</label>
+          <input id="endpoint" type="text" placeholder="http://localhost:1234/v1/chat/completions" />
+        </div>
+      </div>
+    </div>
+
+    <!-- Claude API fields -->
+    <div id="backend-claude" style="display:none;">
+      <div class="row">
+        <div class="field">
+          <label>Anthropic API key</label>
+          <input id="claude_api_key" type="password" placeholder="sk-ant-..." />
+        </div>
+        <div class="field">
+          <label>Model</label>
+          <select id="claude_model" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.85rem;padding:0.5rem 0.75rem;width:100%;">
+            <option value="claude-haiku-4-5-20251001">Haiku 4.5 — fastest, cheapest (~$3 for 1400 convos)</option>
+            <option value="claude-sonnet-4-6">Sonnet 4.6 — better quality (~$15 for 1400 convos)</option>
+          </select>
+        </div>
       </div>
     </div>
 
@@ -362,6 +391,17 @@
 
 <script>
   let currentMode = 'docs';
+  let currentBackend = 'lm_studio';
+
+  function setBackend(backend) {
+    currentBackend = backend;
+    document.getElementById('backend-lm').style.display     = backend === 'lm_studio' ? 'block' : 'none';
+    document.getElementById('backend-claude').style.display = backend === 'claude'    ? 'block' : 'none';
+    document.getElementById('btn-lm').style.background     = backend === 'lm_studio' ? 'var(--accent)' : 'var(--border)';
+    document.getElementById('btn-lm').style.color          = backend === 'lm_studio' ? '#fff' : 'var(--text-dim)';
+    document.getElementById('btn-claude').style.background = backend === 'claude'    ? 'var(--accent)' : 'var(--border)';
+    document.getElementById('btn-claude').style.color      = backend === 'claude'    ? '#fff' : 'var(--text-dim)';
+  }
 
   function setMode(mode) {
     currentMode = mode;
@@ -396,15 +436,21 @@
       source_path:           currentMode === 'docs'    ? document.getElementById("source_path").value.trim() : "",
       chatgpt_path:          currentMode === 'chatgpt' ? document.getElementById("chatgpt_path").value.trim() : "",
       vault_path:            document.getElementById("vault_path").value.trim(),
+      backend:               currentBackend,
       model:                 document.getElementById("model").value.trim(),
       endpoint:              document.getElementById("endpoint").value.trim(),
+      claude_api_key:        document.getElementById("claude_api_key").value.trim(),
+      claude_model:          document.getElementById("claude_model").value,
       batch_size:            parseInt(document.getElementById("batch_size").value),
       enrichment_word_limit: parseInt(document.getElementById("enrichment_word_limit").value),
       dry_run:               document.getElementById("dry_run").checked,
     };
 
-    if (!body.source_path || !body.vault_path) {
-      appendLog("error", "Source folder and vault folder are required.");
+    const hasSource = currentMode === 'docs' ? body.source_path : body.chatgpt_path;
+    if (!hasSource || !body.vault_path) {
+      appendLog("error", currentMode === 'docs'
+        ? "Source folder and vault folder are required."
+        : "ChatGPT export path and vault folder are required.");
       btn.disabled = false;
       return;
     }

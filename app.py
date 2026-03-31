@@ -84,8 +84,11 @@ async def start_run(request: Request):
     source = body.get("source_path", "").strip()
     chatgpt_path = body.get("chatgpt_path", "").strip()
     vault = body.get("vault_path", "").strip()
+    backend = body.get("backend", "lm_studio")
     model = body.get("model", "qwen3").strip()
     endpoint = body.get("endpoint", "http://localhost:1234/v1/chat/completions").strip()
+    claude_api_key = body.get("claude_api_key", "").strip()
+    claude_model = body.get("claude_model", "claude-haiku-4-5-20251001").strip()
     batch_size = int(body.get("batch_size", 10))
     enrichment_word_limit = int(body.get("enrichment_word_limit", 2000))
     split_word_threshold = int(body.get("split_word_threshold", 5000))
@@ -104,6 +107,9 @@ async def start_run(request: Request):
         "source_path": source or None,
         "chatgpt_path": chatgpt_path or None,
         "vault_path": vault,
+        "backend": backend,
+        "claude_api_key": claude_api_key,
+        "claude_model": claude_model,
         "lm_studio": {
             "endpoint": endpoint,
             "model": model,
@@ -257,7 +263,7 @@ def _run_pipeline(job_id: str, cfg: dict, dry_run: bool, q: queue.Queue) -> None
         q.put({
             "type": "done",
             "stats": {
-                "found": len(queue_),
+                "found": len(items),
                 "written": len(all_enriched),
                 "total_state": len(state),
             },
