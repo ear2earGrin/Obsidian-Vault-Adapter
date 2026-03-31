@@ -100,6 +100,7 @@ def load_config(config_path: Optional[Path], source: Optional[str], vault: Optio
             "inbox": "Inbox",
             "pdfs": "Documents/PDFs",
             "word": "Documents/Word",
+            "chatgpt": "Documents/ChatGPT",
             "moc": "MOC",
         },
         "state_file": "processed.json",
@@ -120,9 +121,6 @@ def load_config(config_path: Optional[Path], source: Optional[str], vault: Optio
     else:
         cfg = defaults
 
-    if not cfg.get("source_path"):
-        log.error("source_path is required. Use --source or set it in config.yaml.")
-        sys.exit(1)
     if not cfg.get("vault_path"):
         log.error("vault_path is required. Use --vault or set it in config.yaml.")
         sys.exit(1)
@@ -397,6 +395,129 @@ def extract(path: Path) -> ExtractedDoc:
 
 
 # ---------------------------------------------------------------------------
+# Stage 2b — ChatGPT export parser
+# ---------------------------------------------------------------------------
+
+
+def _reconstruct_messages(mapping: dict) -> list[dict]:
+    """Walk the conversation tree and return messages in order."""
+    # Find root node (no parent, or parent not in mapping)
+    root_id = None
+    for node_id, node in mapping.items():
+        parent = node.get("parent")
+        if parent is None or parent not in mapping:
+            root_id = node_id
+            break
+
+    if root_id is None:
+        return []
+
+    messages: list[dict] = []
+
+    def traverse(node_id: str) -> None:
+        node = mapping.get(node_id)
+        if not node:
+            return
+        msg = node.get("message")
+        if msg:
+            role = msg.get("author", {}).get("role", "")
+            content = msg.get("content", {})
+            parts = content.get("parts", [])
+            # Only keep plain text parts (skip image/tool blocks)
+            text = "\n".join(str(p) for p in parts if isinstance(p, str)).strip()
+            if text and role in ("user", "assistant"):
+                messages.append({
+                    "role": role,
+                    "text": text,
+                    "time": msg.get("create_time"),
+                    "model": msg.get("metadata", {}).get("model_slug", ""),
+                })
+        for child_id in node.get("children", []):
+            traverse(child_id)
+
+    traverse(root_id)
+    return messages
+
+
+def parse_chatgpt_export(export_path: Path, min_words: int = 80) -> list[ExtractedDoc]:
+    """
+    Parse a ChatGPT conversations.json export.
+    Returns one ExtractedDoc per conversation (skipping trivially short ones).
+    """
+    log.info(f"Parsing ChatGPT export: {export_path.name}")
+
+    with open(export_path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not isinstance(data, list):
+        raise ValueError("conversations.json must be a JSON array at the top level")
+
+    docs: list[ExtractedDoc] = []
+
+    for conv in data:
+        title = (conv.get("title") or "Untitled Conversation").strip()
+        create_time = conv.get("create_time")
+        mapping = conv.get("mapping") or {}
+
+        messages = _reconstruct_messages(mapping)
+        if not messages:
+            continue
+
+        # Format as readable dialogue
+        lines: list[str] = []
+        for m in messages:
+            speaker = "**You**" if m["role"] == "user" else "**ChatGPT**"
+            lines.append(f"{speaker}: {m['text']}\n")
+
+        raw_text = "\n".join(lines)
+        word_count = len(raw_text.split())
+
+        if word_count < min_words:
+            continue
+
+        # Derive ISO date from timestamp
+        conv_date = ""
+        if create_time:
+            from datetime import datetime, timezone
+            try:
+                conv_date = datetime.fromtimestamp(create_time, tz=timezone.utc).strftime("%Y-%m-%d")
+            except Exception:
+                pass
+
+        # Use a stable unique ID as the "path" for state tracking
+        conv_id = conv.get("conversation_id") or conv.get("id") or title
+        # Fake path so the rest of the pipeline treats it like a file
+        fake_path = export_path.parent / f"chatgpt__{conv_id}.chatgpt"
+
+        metadata = {
+            "conversation_id": str(conv_id),
+            "date": conv_date,
+            "model": messages[-1].get("model", "") if messages else "",
+            "message_count": str(len(messages)),
+        }
+
+        docs.append(ExtractedDoc(
+            title=title,
+            raw_text=raw_text,
+            headings=[],
+            metadata=metadata,
+            page_count=0,
+            word_count=word_count,
+            source_path=fake_path,
+            file_type="chatgpt",
+        ))
+
+    log.info(f"Parsed {len(docs)} conversations (skipped {len(data) - len(docs)} too short)")
+    return docs
+
+
+def chatgpt_state_key(doc: ExtractedDoc) -> str:
+    """Stable hash key for a ChatGPT conversation (based on conversation_id)."""
+    conv_id = doc.metadata.get("conversation_id", doc.title)
+    return hashlib.sha256(conv_id.encode()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
 # Stage 3 — LM Studio AI enrichment
 # ---------------------------------------------------------------------------
 
@@ -598,7 +719,7 @@ def write_note(
 ) -> list[Path]:
     """Write note(s) to vault, splitting large docs by heading. Returns written paths."""
     doc = enriched.extracted
-    folder_key = "pdfs" if doc.file_type == "pdf" else "word"
+    folder_key = {"pdf": "pdfs", "docx": "word", "chatgpt": "chatgpt"}.get(doc.file_type, "word")
     dest_folder = vault_paths[folder_key]
 
     base_name = _safe_filename(enriched.inferred_title or doc.title)
@@ -773,7 +894,8 @@ def main() -> None:
         description="Convert PDFs and DOCXs into an AI-readable Obsidian vault.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--source", help="Folder containing source documents")
+    parser.add_argument("--source", help="Folder containing source documents (PDFs/DOCXs)")
+    parser.add_argument("--chatgpt", metavar="PATH", help="Path to ChatGPT conversations.json export")
     parser.add_argument("--vault", help="Obsidian vault root folder")
     parser.add_argument("--config", default="config.yaml", help="Path to config.yaml (default: config.yaml)")
     parser.add_argument("--dry-run", action="store_true", help="Scan and extract only — skip AI enrichment and writing")
@@ -789,56 +911,84 @@ def main() -> None:
         vault=args.vault,
     )
 
-    source_path = Path(cfg["source_path"]).expanduser().resolve()
     vault_path = Path(cfg["vault_path"]).expanduser().resolve()
-
-    if not source_path.exists():
-        log.error(f"Source path does not exist: {source_path}")
-        sys.exit(1)
-
     vault_path.mkdir(parents=True, exist_ok=True)
     state_file = vault_path / cfg["state_file"]
     state = load_state(state_file)
 
     console.rule("[bold]Vault Builder[/bold]")
-    console.print(f"  Source : [cyan]{source_path}[/cyan]")
     console.print(f"  Vault  : [cyan]{vault_path}[/cyan]")
     console.print(f"  Model  : [cyan]{cfg['lm_studio']['model']}[/cyan] @ {cfg['lm_studio']['endpoint']}")
     console.print()
 
-    # Stage 1 — Scan
-    queue = scan_files(source_path, state)
-    if not queue:
+    vault_paths = ensure_vault_structure(vault_path, cfg["folders"])
+    all_enriched: list[EnrichedDoc] = []
+
+    # ── Build work queue ────────────────────────────────────────────────────
+    # Either a list of file paths (PDF/DOCX mode) or pre-extracted docs (ChatGPT mode)
+    chatgpt_docs: list[ExtractedDoc] = []
+
+    if args.chatgpt:
+        chatgpt_path = Path(args.chatgpt).expanduser().resolve()
+        if not chatgpt_path.exists():
+            log.error(f"ChatGPT export not found: {chatgpt_path}")
+            sys.exit(1)
+        console.print(f"  Source : [cyan]{chatgpt_path}[/cyan] (ChatGPT export)")
+        all_convs = parse_chatgpt_export(chatgpt_path)
+        # Filter already-processed conversations
+        chatgpt_docs = [d for d in all_convs if chatgpt_state_key(d) not in state]
+        log.info(f"{len(chatgpt_docs)} new conversations to process ({len(all_convs) - len(chatgpt_docs)} already done).")
+        queue: list[Path] = []
+    else:
+        if not cfg.get("source_path"):
+            log.error("source_path is required unless using --chatgpt.")
+            sys.exit(1)
+        source_path = Path(cfg["source_path"]).expanduser().resolve()
+        if not source_path.exists():
+            log.error(f"Source path does not exist: {source_path}")
+            sys.exit(1)
+        console.print(f"  Source : [cyan]{source_path}[/cyan]")
+        queue = scan_files(source_path, state)
+        if not queue:
+            console.print("[green]Nothing new to process. Vault is up to date.[/green]")
+            return
+
+    total_items = len(chatgpt_docs) if args.chatgpt else len(queue)
+    if total_items == 0:
         console.print("[green]Nothing new to process. Vault is up to date.[/green]")
         return
 
-    vault_paths = ensure_vault_structure(vault_path, cfg["folders"])
     batch_size = cfg["batch_size"]
-    all_enriched: list[EnrichedDoc] = []
 
-    # Process in batches
+    # ── Process ─────────────────────────────────────────────────────────────
     with build_progress() as progress:
-        overall = progress.add_task("Overall", total=len(queue))
+        overall = progress.add_task("Overall", total=total_items)
 
-        for batch_start in range(0, len(queue), batch_size):
-            batch = queue[batch_start : batch_start + batch_size]
+        items = chatgpt_docs if args.chatgpt else queue
 
-            for file_path in batch:
-                progress.update(overall, description=f"[bold]{file_path.name}[/bold]")
+        for batch_start in range(0, total_items, batch_size):
+            batch = items[batch_start : batch_start + batch_size]
 
-                # Stage 2 — Extract
-                try:
-                    doc = extract(file_path)
-                except Exception as exc:
-                    log.error(f"Extraction failed for {file_path.name}: {exc}")
-                    progress.advance(overall)
-                    continue
+            for item in batch:
+                # item is ExtractedDoc for ChatGPT, Path for PDF/DOCX
+                if args.chatgpt:
+                    doc = item  # already extracted
+                    label = doc.title[:60]
+                else:
+                    file_path = item
+                    progress.update(overall, description=f"[bold]{file_path.name}[/bold]")
+                    try:
+                        doc = extract(file_path)
+                    except Exception as exc:
+                        log.error(f"Extraction failed for {file_path.name}: {exc}")
+                        progress.advance(overall)
+                        continue
+                    label = file_path.name
+
+                progress.update(overall, description=f"[bold]{label[:60]}[/bold]")
 
                 if args.dry_run:
-                    console.print(
-                        f"  [dim]dry-run[/dim] {file_path.name}: "
-                        f"{doc.word_count} words, {doc.page_count} pages"
-                    )
+                    console.print(f"  [dim]dry-run[/dim] {label}: {doc.word_count} words")
                     progress.advance(overall)
                     continue
 
@@ -846,7 +996,7 @@ def main() -> None:
                 try:
                     enriched = enrich(doc, cfg)
                 except Exception as exc:
-                    log.error(f"Enrichment failed for {file_path.name}: {exc}")
+                    log.error(f"Enrichment failed for {label}: {exc}")
                     enriched = EnrichedDoc(extracted=doc, inferred_title=doc.title)
 
                 # Stage 4+5 — Assemble and write
@@ -854,16 +1004,16 @@ def main() -> None:
                     written_paths = write_note(enriched, vault_paths, cfg)
                     all_enriched.append(enriched)
 
-                    h = file_hash(file_path)
-                    state[h] = {
-                        "source": str(file_path),
+                    state_key = chatgpt_state_key(doc) if args.chatgpt else file_hash(item)
+                    state[state_key] = {
+                        "source": str(doc.source_path),
                         "notes": [str(p) for p in written_paths],
                         "processed_date": date.today().isoformat(),
                     }
                     save_state(state_file, state)
 
                 except Exception as exc:
-                    log.error(f"Failed to write note for {file_path.name}: {exc}")
+                    log.error(f"Failed to write note for {label}: {exc}")
 
                 progress.advance(overall)
 

@@ -82,6 +82,7 @@ async def start_run(request: Request):
     body = await request.json()
 
     source = body.get("source_path", "").strip()
+    chatgpt_path = body.get("chatgpt_path", "").strip()
     vault = body.get("vault_path", "").strip()
     model = body.get("model", "qwen3").strip()
     endpoint = body.get("endpoint", "http://localhost:1234/v1/chat/completions").strip()
@@ -90,15 +91,18 @@ async def start_run(request: Request):
     split_word_threshold = int(body.get("split_word_threshold", 5000))
     dry_run = bool(body.get("dry_run", False))
 
-    if not source or not vault:
-        return {"error": "source_path and vault_path are required"}
+    if not vault:
+        return {"error": "vault_path is required"}
+    if not source and not chatgpt_path:
+        return {"error": "Either source_path or chatgpt_path is required"}
 
     job_id = str(uuid.uuid4())
     q: queue.Queue = queue.Queue()
     _runs[job_id] = {"queue": q, "done": False}
 
     cfg = {
-        "source_path": source,
+        "source_path": source or None,
+        "chatgpt_path": chatgpt_path or None,
         "vault_path": vault,
         "lm_studio": {
             "endpoint": endpoint,
@@ -165,66 +169,83 @@ def _run_pipeline(job_id: str, cfg: dict, dry_run: bool, q: queue.Queue) -> None
     vb_log.addHandler(handler)
 
     try:
-        source_path = Path(cfg["source_path"]).expanduser().resolve()
+        from datetime import date as _date
+
         vault_path = Path(cfg["vault_path"]).expanduser().resolve()
-
-        if not source_path.exists():
-            q.put({"type": "log", "level": "error", "msg": f"Source path not found: {source_path}"})
-            return
-
         vault_path.mkdir(parents=True, exist_ok=True)
         state_file = vault_path / cfg["state_file"]
         state = vb.load_state(state_file)
-
-        q.put({"type": "log", "level": "info", "msg": f"Scanning {source_path} ..."})
-        queue_ = vb.scan_files(source_path, state)
-
-        if not queue_:
-            q.put({"type": "log", "level": "info", "msg": "Nothing new to process. Vault is up to date."})
-            q.put({"type": "done", "stats": {"found": 0, "written": 0, "total_state": len(state)}})
-            return
-
-        q.put({"type": "log", "level": "info", "msg": f"Found {len(queue_)} file(s) to process."})
         vault_paths = vb.ensure_vault_structure(vault_path, cfg["folders"])
         all_enriched: list[vb.EnrichedDoc] = []
         batch_size = cfg["batch_size"]
 
-        for i, file_path in enumerate(queue_, 1):
-            q.put({"type": "progress", "current": i, "total": len(queue_), "file": file_path.name})
-            q.put({"type": "log", "level": "info", "msg": f"[{i}/{len(queue_)}] Extracting {file_path.name}"})
+        # ── Build item list ──────────────────────────────────────────────────
+        chatgpt_mode = bool(cfg.get("chatgpt_path"))
 
-            try:
-                doc = vb.extract(file_path)
-            except Exception as exc:
-                q.put({"type": "log", "level": "error", "msg": f"Extraction failed: {exc}"})
-                continue
+        if chatgpt_mode:
+            chatgpt_path = Path(cfg["chatgpt_path"]).expanduser().resolve()
+            if not chatgpt_path.exists():
+                q.put({"type": "log", "level": "error", "msg": f"ChatGPT export not found: {chatgpt_path}"})
+                return
+            q.put({"type": "log", "level": "info", "msg": f"Parsing {chatgpt_path.name} ..."})
+            all_convs = vb.parse_chatgpt_export(chatgpt_path)
+            items = [d for d in all_convs if vb.chatgpt_state_key(d) not in state]
+            q.put({"type": "log", "level": "info",
+                   "msg": f"{len(items)} new conversations ({len(all_convs) - len(items)} already processed)."})
+        else:
+            source_path = Path(cfg["source_path"]).expanduser().resolve()
+            if not source_path.exists():
+                q.put({"type": "log", "level": "error", "msg": f"Source path not found: {source_path}"})
+                return
+            q.put({"type": "log", "level": "info", "msg": f"Scanning {source_path} ..."})
+            items = vb.scan_files(source_path, state)
+            q.put({"type": "log", "level": "info", "msg": f"Found {len(items)} file(s) to process."})
+
+        if not items:
+            q.put({"type": "log", "level": "info", "msg": "Nothing new to process. Vault is up to date."})
+            q.put({"type": "done", "stats": {"found": 0, "written": 0, "total_state": len(state)}})
+            return
+
+        # ── Process each item ────────────────────────────────────────────────
+        for i, item in enumerate(items, 1):
+            label = item.title[:60] if chatgpt_mode else item.name
+            q.put({"type": "progress", "current": i, "total": len(items), "file": label})
+            q.put({"type": "log", "level": "info", "msg": f"[{i}/{len(items)}] {label}"})
+
+            if chatgpt_mode:
+                doc = item
+            else:
+                try:
+                    doc = vb.extract(item)
+                except Exception as exc:
+                    q.put({"type": "log", "level": "error", "msg": f"Extraction failed: {exc}"})
+                    continue
 
             if dry_run:
-                q.put({
-                    "type": "log", "level": "info",
-                    "msg": f"  dry-run — {doc.word_count} words, {doc.page_count} pages"
-                })
+                q.put({"type": "log", "level": "info",
+                       "msg": f"  dry-run — {doc.word_count} words"})
                 continue
 
             q.put({"type": "log", "level": "info", "msg": f"  Enriching with {cfg['lm_studio']['model']} ..."})
             try:
                 enriched = vb.enrich(doc, cfg)
             except Exception as exc:
-                q.put({"type": "log", "level": "warning", "msg": f"  Enrichment failed: {exc}. Using empty metadata."})
+                q.put({"type": "log", "level": "warning",
+                       "msg": f"  Enrichment failed: {exc}. Using empty metadata."})
                 enriched = vb.EnrichedDoc(extracted=doc, inferred_title=doc.title)
 
             try:
                 written = vb.write_note(enriched, vault_paths, cfg)
                 all_enriched.append(enriched)
-                h = vb.file_hash(file_path)
-                from datetime import date
-                state[h] = {
-                    "source": str(file_path),
+                state_key = vb.chatgpt_state_key(doc) if chatgpt_mode else vb.file_hash(item)
+                state[state_key] = {
+                    "source": str(doc.source_path),
                     "notes": [str(p) for p in written],
-                    "processed_date": date.today().isoformat(),
+                    "processed_date": _date.today().isoformat(),
                 }
                 vb.save_state(state_file, state)
-                q.put({"type": "log", "level": "info", "msg": f"  Written: {', '.join(p.name for p in written)}"})
+                q.put({"type": "log", "level": "info",
+                       "msg": f"  Written: {', '.join(p.name for p in written)}"})
             except Exception as exc:
                 q.put({"type": "log", "level": "error", "msg": f"  Write failed: {exc}"})
 
