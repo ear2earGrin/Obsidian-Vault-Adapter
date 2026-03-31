@@ -290,13 +290,28 @@
     <div class="field">
       <label>Enrichment backend</label>
       <div style="display:flex;gap:0.5rem;margin-top:0.3rem;">
-        <button id="btn-lm" onclick="setBackend('lm_studio')" style="flex:1;background:var(--accent);color:#fff;font-size:0.8rem;padding:0.4rem 0.8rem;border-radius:6px;">Local (LM Studio)</button>
+        <button id="btn-ollama" onclick="setBackend('ollama')" style="flex:1;background:var(--accent);color:#fff;font-size:0.8rem;padding:0.4rem 0.8rem;border-radius:6px;">Ollama</button>
+        <button id="btn-lm" onclick="setBackend('lm_studio')" style="flex:1;background:var(--border);color:var(--text-dim);font-size:0.8rem;padding:0.4rem 0.8rem;border-radius:6px;">LM Studio</button>
         <button id="btn-claude" onclick="setBackend('claude')" style="flex:1;background:var(--border);color:var(--text-dim);font-size:0.8rem;padding:0.4rem 0.8rem;border-radius:6px;">Claude API</button>
       </div>
     </div>
 
+    <!-- Ollama fields -->
+    <div id="backend-ollama">
+      <div class="row">
+        <div class="field">
+          <label>Ollama model</label>
+          <input id="ollama_model" type="text" value="qwen3:8b" />
+        </div>
+        <div class="field">
+          <label>Ollama endpoint</label>
+          <input id="ollama_endpoint" type="text" value="http://localhost:11434/v1/chat/completions" />
+        </div>
+      </div>
+    </div>
+
     <!-- LM Studio fields -->
-    <div id="backend-lm">
+    <div id="backend-lm" style="display:none;">
       <div class="row">
         <div class="field">
           <label>LM Studio model name</label>
@@ -395,12 +410,14 @@
 
   function setBackend(backend) {
     currentBackend = backend;
+    document.getElementById('backend-ollama').style.display = backend === 'ollama'    ? 'block' : 'none';
     document.getElementById('backend-lm').style.display     = backend === 'lm_studio' ? 'block' : 'none';
     document.getElementById('backend-claude').style.display = backend === 'claude'    ? 'block' : 'none';
-    document.getElementById('btn-lm').style.background     = backend === 'lm_studio' ? 'var(--accent)' : 'var(--border)';
-    document.getElementById('btn-lm').style.color          = backend === 'lm_studio' ? '#fff' : 'var(--text-dim)';
-    document.getElementById('btn-claude').style.background = backend === 'claude'    ? 'var(--accent)' : 'var(--border)';
-    document.getElementById('btn-claude').style.color      = backend === 'claude'    ? '#fff' : 'var(--text-dim)';
+    ['ollama', 'lm', 'claude'].forEach(b => {
+      const id = b === 'lm' ? 'lm_studio' : b;
+      document.getElementById(`btn-${b}`).style.background = backend === id ? 'var(--accent)' : 'var(--border)';
+      document.getElementById(`btn-${b}`).style.color      = backend === id ? '#fff' : 'var(--text-dim)';
+    });
   }
 
   function setMode(mode) {
@@ -441,6 +458,8 @@
       endpoint:              document.getElementById("endpoint").value.trim(),
       claude_api_key:        document.getElementById("claude_api_key").value.trim(),
       claude_model:          document.getElementById("claude_model").value,
+      ollama_model:          document.getElementById("ollama_model").value.trim(),
+      ollama_endpoint:       document.getElementById("ollama_endpoint").value.trim(),
       batch_size:            parseInt(document.getElementById("batch_size").value),
       enrichment_word_limit: parseInt(document.getElementById("enrichment_word_limit").value),
       dry_run:               document.getElementById("dry_run").checked,

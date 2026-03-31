@@ -89,6 +89,8 @@ async def start_run(request: Request):
     endpoint = body.get("endpoint", "http://localhost:1234/v1/chat/completions").strip()
     claude_api_key = body.get("claude_api_key", "").strip()
     claude_model = body.get("claude_model", "claude-haiku-4-5-20251001").strip()
+    ollama_model = body.get("ollama_model", "qwen3:8b").strip()
+    ollama_endpoint = body.get("ollama_endpoint", "http://localhost:11434/v1/chat/completions").strip()
     batch_size = int(body.get("batch_size", 10))
     enrichment_word_limit = int(body.get("enrichment_word_limit", 2000))
     split_word_threshold = int(body.get("split_word_threshold", 5000))
@@ -110,6 +112,8 @@ async def start_run(request: Request):
         "backend": backend,
         "claude_api_key": claude_api_key,
         "claude_model": claude_model,
+        "ollama_model": ollama_model,
+        "ollama_endpoint": ollama_endpoint,
         "lm_studio": {
             "endpoint": endpoint,
             "model": model,

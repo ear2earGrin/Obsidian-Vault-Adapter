@@ -567,6 +567,47 @@ def call_lm_studio(excerpt: str, title: str, word_count: int, cfg: dict) -> dict
     }
 
 
+def _strip_thinking(content: str) -> str:
+    """Remove Qwen3 <think>...</think> reasoning blocks before parsing JSON."""
+    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+    content = re.sub(r"^```(?:json)?\s*", "", content.strip())
+    content = re.sub(r"\s*```$", "", content)
+    return content.strip()
+
+
+def call_ollama(excerpt: str, title: str, word_count: int, cfg: dict) -> dict:
+    model = cfg.get("ollama_model", "qwen3:8b")
+    endpoint = cfg.get("ollama_endpoint", "http://localhost:11434/v1/chat/completions")
+    # Disable thinking mode for JSON tasks — faster and cleaner output
+    prompt = ENRICHMENT_PROMPT.format(title=title, word_count=word_count, excerpt=excerpt)
+
+    for attempt in range(1, 4):
+        try:
+            resp = requests.post(
+                endpoint,
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.3,
+                    "max_tokens": 512,
+                    "options": {"think": False},  # Qwen3: disable chain-of-thought
+                },
+                timeout=120,
+            )
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"]
+            content = _strip_thinking(content)
+            return json.loads(content)
+
+        except (requests.RequestException, json.JSONDecodeError, KeyError) as exc:
+            log.warning(f"Ollama attempt {attempt}/3 failed: {exc}")
+            if attempt < 3:
+                time.sleep(3)
+
+    log.error("All Ollama retries exhausted. Using empty enrichment.")
+    return {"summary": "", "tags": [], "inferred_title": title, "key_concepts": []}
+
+
 def call_claude_api(excerpt: str, title: str, word_count: int, cfg: dict) -> dict:
     api_key = cfg.get("claude_api_key", "")
     model = cfg.get("claude_model", "claude-haiku-4-5-20251001")
@@ -611,6 +652,13 @@ def enrich(doc: ExtractedDoc, cfg: dict) -> EnrichedDoc:
     backend = cfg.get("backend", "lm_studio")
     if backend == "claude":
         result = call_claude_api(
+            excerpt=excerpt,
+            title=doc.title,
+            word_count=min(len(words), word_limit),
+            cfg=cfg,
+        )
+    elif backend == "ollama":
+        result = call_ollama(
             excerpt=excerpt,
             title=doc.title,
             word_count=min(len(words), word_limit),
