@@ -589,7 +589,7 @@ def call_ollama(excerpt: str, title: str, word_count: int, cfg: dict) -> dict:
                     "model": model,
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.3,
-                    "max_tokens": 512,
+                    "max_tokens": 1024,
                     "options": {"think": False},  # Qwen3: disable chain-of-thought
                 },
                 timeout=120,
@@ -806,7 +806,8 @@ def write_note(
     base_name = _safe_filename(enriched.inferred_title or doc.title)
     written: list[Path] = []
 
-    if doc.word_count > cfg["split_word_threshold"]:
+    # Never split ChatGPT conversations — they're dialogues, not documents
+    if doc.file_type != "chatgpt" and doc.word_count > cfg["split_word_threshold"]:
         # Split by top-level headings
         body = _inject_wikilinks(doc.raw_text, enriched.key_concepts)
         sections = _split_by_headings(body)
