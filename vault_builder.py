@@ -86,6 +86,7 @@ def load_config(config_path: Optional[Path], source: Optional[str], vault: Optio
     defaults = {
         "source_path": source,
         "vault_path": vault,
+        "backend": "lm_studio",
         "lm_studio": {
             "endpoint": "http://localhost:1234/v1/chat/completions",
             "model": "qwen3",
@@ -570,38 +571,84 @@ def call_lm_studio(excerpt: str, title: str, word_count: int, cfg: dict) -> dict
 def _strip_thinking(content: str) -> str:
     """Remove Qwen3 <think>...</think> reasoning blocks before parsing JSON."""
     content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+    # An unterminated block means the model hit its token budget mid-reasoning.
+    # Drop it so anything that came before still has a chance of parsing.
+    content = re.sub(r"<think>.*$", "", content, flags=re.DOTALL)
     content = re.sub(r"^```(?:json)?\s*", "", content.strip())
     content = re.sub(r"\s*```$", "", content)
     return content.strip()
 
 
+def _parse_enrichment_json(content: str) -> dict:
+    """
+    Parse an enrichment reply, tolerating thinking blocks, code fences, and
+    prose wrapped around the JSON object.
+    """
+    cleaned = _strip_thinking(content)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        # Fall back to the outermost {...} span in the reply
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end > start:
+            return json.loads(cleaned[start : end + 1])
+        raise
+
+
+def _ollama_native_endpoint(endpoint: str) -> str:
+    """
+    Map an OpenAI-compatible Ollama URL onto the native chat route.
+
+    Only the native route honours `think` and `format`, both of which thinking
+    models need in order to return parseable JSON.
+    """
+    trimmed = endpoint.rstrip("/")
+    suffix = "/v1/chat/completions"
+    if trimmed.endswith(suffix):
+        return trimmed[: -len(suffix)] + "/api/chat"
+    return endpoint
+
+
 def call_ollama(excerpt: str, title: str, word_count: int, cfg: dict) -> dict:
     model = cfg.get("ollama_model", "qwen3:8b")
-    endpoint = cfg.get("ollama_endpoint", "http://localhost:11434/v1/chat/completions")
-    # Disable thinking mode for JSON tasks — faster and cleaner output
+    endpoint = _ollama_native_endpoint(
+        cfg.get("ollama_endpoint", "http://localhost:11434/v1/chat/completions")
+    )
+    num_predict = int(cfg.get("ollama_num_predict", 2048))
     prompt = ENRICHMENT_PROMPT.format(title=title, word_count=word_count, excerpt=excerpt)
 
-    for attempt in range(1, 4):
+    # `think: False` stops thinking models (qwen3) from spending the whole token
+    # budget on reasoning; `format: json` constrains the reply to valid JSON.
+    # Models with no thinking support reject `think` outright, so drop it and
+    # retry when the server says so.
+    send_think = True
+
+    for attempt in range(1, 5):
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "format": "json",
+            "options": {"temperature": 0.3, "num_predict": num_predict},
+        }
+        if send_think:
+            payload["think"] = False
+
         try:
-            resp = requests.post(
-                endpoint,
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.3,
-                    "max_tokens": 1024,
-                    "options": {"think": False},  # Qwen3: disable chain-of-thought
-                },
-                timeout=120,
-            )
+            resp = requests.post(endpoint, json=payload, timeout=120)
+
+            if resp.status_code == 400 and send_think and "think" in resp.text.lower():
+                log.info(f"{model} has no thinking mode — retrying without it.")
+                send_think = False
+                continue
+
             resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"]
-            content = _strip_thinking(content)
-            return json.loads(content)
+            return _parse_enrichment_json(resp.json()["message"]["content"])
 
         except (requests.RequestException, json.JSONDecodeError, KeyError) as exc:
-            log.warning(f"Ollama attempt {attempt}/3 failed: {exc}")
-            if attempt < 3:
+            log.warning(f"Ollama attempt {attempt}/4 failed: {exc}")
+            if attempt < 4:
                 time.sleep(3)
 
     log.error("All Ollama retries exhausted. Using empty enrichment.")
@@ -998,9 +1045,23 @@ def main() -> None:
     state_file = vault_path / cfg["state_file"]
     state = load_state(state_file)
 
+    backend = cfg.get("backend", "lm_studio")
+    if backend == "ollama":
+        model_label = cfg.get("ollama_model", "qwen3:8b")
+        endpoint_label = _ollama_native_endpoint(
+            cfg.get("ollama_endpoint", "http://localhost:11434/v1/chat/completions")
+        )
+    elif backend == "claude":
+        model_label = cfg.get("claude_model", "claude-haiku-4-5-20251001")
+        endpoint_label = "https://api.anthropic.com/v1/messages"
+    else:
+        model_label = cfg["lm_studio"]["model"]
+        endpoint_label = cfg["lm_studio"]["endpoint"]
+
     console.rule("[bold]Vault Builder[/bold]")
     console.print(f"  Vault  : [cyan]{vault_path}[/cyan]")
-    console.print(f"  Model  : [cyan]{cfg['lm_studio']['model']}[/cyan] @ {cfg['lm_studio']['endpoint']}")
+    console.print(f"  Backend: [cyan]{backend}[/cyan]")
+    console.print(f"  Model  : [cyan]{model_label}[/cyan] @ {endpoint_label}")
     console.print()
 
     vault_paths = ensure_vault_structure(vault_path, cfg["folders"])

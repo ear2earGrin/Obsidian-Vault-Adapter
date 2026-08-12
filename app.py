@@ -128,6 +128,7 @@ async def start_run(request: Request):
             "inbox": "Inbox",
             "pdfs": "Documents/PDFs",
             "word": "Documents/Word",
+            "chatgpt": "Documents/ChatGPT",
             "moc": "MOC",
         },
         "state_file": "processed.json",
