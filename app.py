@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -84,7 +85,7 @@ async def start_run(request: Request):
     source = body.get("source_path", "").strip()
     chatgpt_path = body.get("chatgpt_path", "").strip()
     vault = body.get("vault_path", "").strip()
-    backend = body.get("backend", "lm_studio")
+    backend = body.get("backend", "ollama")
     model = body.get("model", "qwen3").strip()
     endpoint = body.get("endpoint", "http://localhost:1234/v1/chat/completions").strip()
     claude_api_key = body.get("claude_api_key", "").strip()
@@ -170,6 +171,38 @@ async def status(job_id: str):
 # ---------------------------------------------------------------------------
 # Pipeline runner (runs in a background thread)
 # ---------------------------------------------------------------------------
+
+
+def _refresh_qmd_index(q: queue.Queue) -> None:
+    """
+    Re-index the vault with qmd so Claude can search new notes immediately.
+
+    Best-effort: qmd is optional (installed by setup_mcp.py), so a missing
+    binary or a failing step is reported and skipped rather than failing the run.
+    """
+    q.put({"type": "log", "level": "info", "msg": "Updating qmd search index ..."})
+    steps = (("update", 120), ("embed", 300))
+
+    for step, timeout in steps:
+        try:
+            proc = subprocess.run(
+                ["qmd", step], capture_output=True, text=True, timeout=timeout
+            )
+        except FileNotFoundError:
+            q.put({"type": "log", "level": "warning",
+                   "msg": "qmd not installed — skipping index update. Run setup_mcp.py to enable it."})
+            return
+        except Exception as exc:
+            q.put({"type": "log", "level": "warning", "msg": f"qmd {step} skipped: {exc}"})
+            return
+
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            reason = detail[-1] if detail else f"exit code {proc.returncode}"
+            q.put({"type": "log", "level": "warning", "msg": f"qmd {step} failed: {reason}"})
+            return
+
+    q.put({"type": "log", "level": "info", "msg": "qmd index updated."})
 
 
 def _run_pipeline(job_id: str, cfg: dict, dry_run: bool, q: queue.Queue) -> None:
@@ -264,6 +297,7 @@ def _run_pipeline(job_id: str, cfg: dict, dry_run: bool, q: queue.Queue) -> None
             q.put({"type": "log", "level": "info", "msg": "Regenerating MOC files ..."})
             vb.generate_moc_all(all_enriched, vault_paths["moc"])
             vb.generate_moc_tags(all_enriched, vault_paths["moc"])
+            _refresh_qmd_index(q)
 
         q.put({
             "type": "done",
