@@ -610,13 +610,34 @@ def _ollama_native_endpoint(endpoint: str) -> str:
     return endpoint
 
 
+def _no_think_prompt(prompt: str, model: str) -> str:
+    """
+    Qwen3 reasons by default and will spend its entire token budget doing so,
+    leaving no room for the JSON we asked for.
+
+    `/no_think` is Qwen3's own soft switch, honoured by the model's chat
+    template, so it works regardless of whether the installed Ollama supports
+    the top-level `think` parameter (added in Ollama 0.9.0 — older builds
+    ignore it silently rather than rejecting it).
+    """
+    if "qwen3" in model.lower():
+        return f"{prompt}\n\n/no_think"
+    return prompt
+
+
 def call_ollama(excerpt: str, title: str, word_count: int, cfg: dict) -> dict:
     model = cfg.get("ollama_model", "qwen3:8b")
     endpoint = _ollama_native_endpoint(
         cfg.get("ollama_endpoint", "http://localhost:11434/v1/chat/completions")
     )
-    num_predict = int(cfg.get("ollama_num_predict", 2048))
-    prompt = ENRICHMENT_PROMPT.format(title=title, word_count=word_count, excerpt=excerpt)
+    # Keep the cap low enough that a runaway generation fails inside the request
+    # timeout rather than hanging on it; the JSON we want is a few hundred tokens.
+    num_predict = int(cfg.get("ollama_num_predict", 1024))
+    timeout = int(cfg.get("ollama_timeout", 120))
+    prompt = _no_think_prompt(
+        ENRICHMENT_PROMPT.format(title=title, word_count=word_count, excerpt=excerpt),
+        model,
+    )
 
     # `think: False` stops thinking models (qwen3) from spending the whole token
     # budget on reasoning; `format: json` constrains the reply to valid JSON.
@@ -636,7 +657,7 @@ def call_ollama(excerpt: str, title: str, word_count: int, cfg: dict) -> dict:
             payload["think"] = False
 
         try:
-            resp = requests.post(endpoint, json=payload, timeout=120)
+            resp = requests.post(endpoint, json=payload, timeout=timeout)
 
             if resp.status_code == 400 and send_think and "think" in resp.text.lower():
                 log.info(f"{model} has no thinking mode — retrying without it.")
