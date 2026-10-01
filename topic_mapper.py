@@ -374,7 +374,13 @@ def _embed_one(text: str, base_url: str, model: str) -> list:
 
 def embed_notes(
     notes: list[Note], settings: dict, cfg: dict, cache: EmbeddingCache
-) -> tuple[np.ndarray, list[str]]:
+) -> tuple[list[Note], np.ndarray, list[str]]:
+    """
+    Embed `notes`, reusing cached vectors. Returns the notes that embedded
+    cleanly with their normalised vectors and cache keys; any note whose
+    vector came back non-finite or all zeros is dropped from the cache and
+    left out, so it gets a fresh attempt on the next run.
+    """
     model = settings["embed_model"]
     texts = [embed_text(n, settings) for n in notes]
     keys = [hashlib.sha256(f"{model}\n{t}".encode("utf-8")).hexdigest() for t in texts]
@@ -397,7 +403,30 @@ def embed_notes(
         log.info(f"All {len(notes)} embeddings cached.")
 
     X = np.stack([cache.vectors[k] for k in keys]).astype(np.float32)
-    return l2_normalize(X), keys
+    good = np.isfinite(X).all(axis=1) & (np.abs(X).sum(axis=1) > 0)
+    if not good.all():
+        bad = np.flatnonzero(~good)
+        log.warning(f"{len(bad)} note(s) got an unusable embedding and were left out; rerun to retry them.")
+        for i in bad:
+            cache.vectors.pop(keys[i], None)
+        notes = [n for n, ok in zip(notes, good) if ok]
+        keys = [k for k, ok in zip(keys, good) if ok]
+        X = X[good]
+    return notes, l2_normalize(X), keys
+
+
+def _dot(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """
+    Matrix product without numpy's floating-point warnings. numpy builds that
+    use Apple's Accelerate library can raise spurious divide-by-zero and
+    overflow warnings in matmul even for normal inputs, so the result is
+    checked directly instead.
+    """
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        out = a @ b
+    if not np.isfinite(out).all():
+        raise FloatingPointError("similarity matrix contains non-finite values")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -416,23 +445,51 @@ def cluster(X: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
         from sklearn.cluster import KMeans
     except ImportError:
         sys.exit("scikit-learn is not installed. Run: pip install -r requirements.txt")
-    km = KMeans(n_clusters=k, n_init=10, random_state=42).fit(X)
+    # Same spurious Accelerate warnings as in _dot; inputs are already checked
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        km = KMeans(n_clusters=k, n_init=10, random_state=42).fit(X)
     return km.labels_, l2_normalize(km.cluster_centers_)
 
 
-def related_candidates(X: np.ndarray, rels: list[str], top: int = 5) -> list[list]:
-    """The `top` most similar other notes for each note, as [rel, similarity]."""
+_PARENT_LINK = re.compile(r"^\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]$")
+
+
+def note_families(notes: list[Note]) -> list[list[int]]:
+    """
+    Group the adapter's split notes with their parent, so a long document or
+    conversation split into 40 section notes counts as one item instead of
+    forming a topic of its own. Section notes carry `parent: "[[Name]]"`; the
+    parent is the note called Name in the same folder. Everything else is a
+    family of one.
+    """
+    groups: dict[tuple[str, str], list[int]] = {}
+    for i, note in enumerate(notes):
+        folder = note.rel.rsplit("/", 1)[0] if "/" in note.rel else ""
+        parent = note.fm.get("parent")
+        match = _PARENT_LINK.match(parent.strip()) if isinstance(parent, str) else None
+        name = match.group(1).split("/")[-1] if match else note.title
+        groups.setdefault((folder, name.strip().lower()), []).append(i)
+    return list(groups.values())
+
+
+def related_candidates(
+    X: np.ndarray, rels: list[str], family_of: np.ndarray, top: int = 5
+) -> list[list]:
+    """
+    The `top` most similar other notes for each note, as [rel, similarity].
+    Sections of the same split document are skipped, since they'd always win.
+    """
     top = min(top, len(rels) - 1)
     if top <= 0:
         return [[] for _ in rels]
     out = []
     for start in range(0, len(X), 512):
-        block = X[start : start + 512] @ X.T
+        block = _dot(X[start : start + 512], X.T)
         for row_i, row in enumerate(block):
-            row[start + row_i] = -1.0
+            row[family_of == family_of[start + row_i]] = -1.0
             idx = np.argpartition(-row, top - 1)[:top]
             idx = idx[np.argsort(-row[idx])]
-            out.append([[rels[j], round(float(row[j]), 4)] for j in idx])
+            out.append([[rels[j], round(float(row[j]), 4)] for j in idx if row[j] > -1.0])
     return out
 
 
@@ -785,7 +842,7 @@ def cmd_scan(args, cfg: dict, vault: Path, settings: dict) -> None:
 
     cache = EmbeddingCache(state / f"embeddings-{_file_slug(settings['embed_model'])}.npz")
     try:
-        X, keys = embed_notes(usable, settings, cfg, cache)
+        usable, X, keys = embed_notes(usable, settings, cfg, cache)
     except (ModelMissing, RuntimeError) as exc:
         log.error(f"{exc}. Embeddings done so far are cached; rerun to continue.")
         sys.exit(1)
@@ -793,27 +850,47 @@ def cmd_scan(args, cfg: dict, vault: Path, settings: dict) -> None:
         cache.save()
     cache.save(keep=set(keys))  # forget notes that were deleted or have changed
 
-    n = len(usable)
+    # Cluster whole documents rather than their split sections: each family's
+    # vector is the mean of its members, and every member inherits the result.
+    families = note_families(usable)
+    family_of = np.empty(len(usable), dtype=np.int64)
+    for f, members in enumerate(families):
+        family_of[members] = f
+    U = l2_normalize(np.stack([X[members].mean(axis=0) for members in families]))
+    # The parent note (no `parent` property) speaks for its family in naming
+    reps = [next((i for i in members if "parent" not in usable[i].fm), members[0]) for members in families]
+    split = sum(1 for members in families if len(members) > 1)
+    if split:
+        log.info(f"Grouped {sum(len(m) for m in families if len(m) > 1)} split notes into {split} documents.")
+
+    n = len(families)
     k = max(2, min(args.k or default_k(n, settings["granularity"]), n // min_size))
-    log.info(f"Clustering {n} notes into {k} topics ...")
-    labels, centers = cluster(X, k)
+    log.info(f"Clustering {n} documents into {k} topics ...")
+    labels, centers = cluster(U, k)
 
     # Dissolve clusters too small to be a topic, renumber the rest by size, and
-    # give every note its nearest surviving topic.
+    # give every document its nearest surviving topic.
     sizes = np.bincount(labels, minlength=k)
     kept = [int(c) for c in np.argsort(-sizes, kind="stable") if sizes[c] >= min_size]
     if not kept:
         log.error("No cluster reached min_topic_size. Lower it in config.yaml or pass a smaller --k.")
         sys.exit(1)
     centers = centers[kept]
-    sims = X @ centers.T
-    topic_of = sims.argmax(axis=1)
-    fit = sims.max(axis=1)
-    threshold = float(np.percentile(fit, settings["low_confidence_pct"]))
+    sims = _dot(U, centers.T)
+    family_topic = sims.argmax(axis=1)
+    family_fit = sims.max(axis=1)
+    threshold = float(np.percentile(family_fit, settings["low_confidence_pct"]))
+
+    topic_of = family_topic[family_of]
+    fit = family_fit[family_of]
     low = fit < threshold
 
-    related = related_candidates(X, [note.rel for note in usable])
-    topics = name_topics(usable, topic_of, fit, len(kept), cfg, settings)
+    related = related_candidates(X, [note.rel for note in usable], family_of)
+    topics = name_topics([usable[r] for r in reps], family_topic, family_fit, len(kept), cfg, settings)
+    for t in topics:
+        # name_topics works on families; expand back to individual notes
+        t["examples"] = [usable[reps[f]].title for f in t["members"][:5]]
+        t["members"] = [i for f in t["members"] for i in families[f]]
 
     # ── Proposal files ─────────────────────────────────────────────────────
     state.mkdir(parents=True, exist_ok=True)
@@ -855,7 +932,7 @@ def cmd_scan(args, cfg: dict, vault: Path, settings: dict) -> None:
         "skip": False,
         "notes": len(t["members"]),
         "low_confidence": int(sum(low[i] for i in t["members"])),
-        "examples": [usable[i].title for i in t["members"][:5]],
+        "examples": t["examples"],
     } for t in topics]
     header = (
         "# Proposed topics from `python topic_mapper.py scan`.\n"
@@ -887,7 +964,7 @@ def cmd_scan(args, cfg: dict, vault: Path, settings: dict) -> None:
     table.add_column("Notes", justify="right")
     table.add_column("Examples", overflow="fold")
     for t in topics:
-        examples = "; ".join(usable[i].title for i in t["members"][:3])
+        examples = "; ".join(t["examples"][:3])
         table.add_row(str(t["id"]), t["tag"], str(len(t["members"])), examples)
     console.print()
     console.print(table)
@@ -1169,13 +1246,13 @@ def cmd_assign(args, cfg: dict, vault: Path, settings: dict) -> None:
     if usable:
         cache = EmbeddingCache(state / f"embeddings-{_file_slug(settings['embed_model'])}.npz")
         try:
-            X, _ = embed_notes(usable, settings, cfg, cache)
+            usable, X, _ = embed_notes(usable, settings, cfg, cache)
         except (ModelMissing, RuntimeError) as exc:
             log.error(str(exc))
             sys.exit(1)
         finally:
             cache.save()
-        sims = X @ centers.T
+        sims = _dot(X, centers.T)
         for note, best, score in zip(usable, sims.argmax(axis=1), sims.max(axis=1)):
             topic = topics.get(int(best))
             ok = topic and not topic.get("skip") and topic.get("tag") and score >= threshold
