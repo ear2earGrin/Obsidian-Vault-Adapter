@@ -635,16 +635,21 @@ def update_frontmatter(note: Note, tags: list[str], related: Optional[list[str]]
         else:
             lines[position:position] = block
 
-    return f"---{nl}{''.join(lines)}---{nl}{note.body}"
+    new_fm = "".join(lines)
+    if not new_fm.strip():
+        # Nothing left, e.g. a note whose only property was `related`: drop
+        # the empty fences too, so the note goes back to having no frontmatter
+        return note.body
+    return f"---{nl}{new_fm}---{nl}{note.body}"
 
 
 def verify_update(note: Note, new_text: str, tags: list[str], related: Optional[list[str]]) -> bool:
     """Re-parse the edit: body identical, other properties identical, new values exact."""
     fm_raw, body = split_frontmatter(new_text)
-    if fm_raw is None or body != note.body:
+    if body != note.body:
         return False
     try:
-        parsed = yaml.safe_load(fm_raw) or {}
+        parsed = (yaml.safe_load(fm_raw) or {}) if fm_raw is not None else {}
     except yaml.YAMLError:
         return False
     if not isinstance(parsed, dict) or as_tag_list(parsed.get("tags")) != tags:
@@ -1133,7 +1138,9 @@ def cmd_apply(args, cfg: dict, vault: Path, settings: dict) -> None:
         tags = merged_tags(as_tag_list(note.fm.get("tags")), additions)
 
         related = None
-        if args.related > 0:
+        if args.clear_related:
+            related = []  # an empty list removes the property
+        elif args.related > 0:
             related = []
             for other, score in entry.get("related") or []:
                 if score < min_sim or len(related) >= args.related:
@@ -1318,6 +1325,8 @@ def main() -> None:
     apply.add_argument("--limit", type=int, help="Only edit the first N notes, as a test")
     apply.add_argument("--related", type=int, default=0, metavar="N",
                        help="Also add up to N similar notes as a `related` property")
+    apply.add_argument("--clear-related", action="store_true",
+                       help="Remove the `related` property that --related added")
     apply.add_argument("--include-low-confidence", action="store_true",
                        help="Tag weak fits with their closest topic too")
 
@@ -1325,6 +1334,8 @@ def main() -> None:
     assign.add_argument("--write", action="store_true", help="Write the tags (default is a dry run)")
 
     args = parser.parse_args()
+    if args.command == "apply" and args.clear_related and args.related:
+        parser.error("use either --related N or --clear-related, not both")
 
     config_path = Path(args.config) if args.config else None
     cfg = vb.load_config(config_path, None, args.vault)
