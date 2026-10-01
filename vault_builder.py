@@ -625,8 +625,14 @@ def _no_think_prompt(prompt: str, model: str) -> str:
     return prompt
 
 
-def call_ollama(excerpt: str, title: str, word_count: int, cfg: dict) -> dict:
-    model = cfg.get("ollama_model", "qwen3:8b")
+def ollama_chat_json(prompt: str, cfg: dict, model: Optional[str] = None) -> Optional[dict]:
+    """
+    Send one prompt to Ollama and parse the reply as a JSON object.
+
+    Returns None once every attempt has failed, so each caller picks its own
+    fallback. Shared by enrichment here and topic naming in topic_mapper.py.
+    """
+    model = model or cfg.get("ollama_model", "qwen3:8b")
     endpoint = _ollama_native_endpoint(
         cfg.get("ollama_endpoint", "http://localhost:11434/v1/chat/completions")
     )
@@ -634,10 +640,7 @@ def call_ollama(excerpt: str, title: str, word_count: int, cfg: dict) -> dict:
     # timeout rather than hanging on it; the JSON we want is a few hundred tokens.
     num_predict = int(cfg.get("ollama_num_predict", 1024))
     timeout = int(cfg.get("ollama_timeout", 120))
-    prompt = _no_think_prompt(
-        ENRICHMENT_PROMPT.format(title=title, word_count=word_count, excerpt=excerpt),
-        model,
-    )
+    prompt = _no_think_prompt(prompt, model)
 
     # `think: False` stops thinking models (qwen3) from spending the whole token
     # budget on reasoning; `format: json` constrains the reply to valid JSON.
@@ -665,15 +668,26 @@ def call_ollama(excerpt: str, title: str, word_count: int, cfg: dict) -> dict:
                 continue
 
             resp.raise_for_status()
-            return _parse_enrichment_json(resp.json()["message"]["content"])
+            result = _parse_enrichment_json(resp.json()["message"]["content"])
+            if not isinstance(result, dict):
+                raise ValueError("reply was JSON but not an object")
+            return result
 
-        except (requests.RequestException, json.JSONDecodeError, KeyError) as exc:
+        except (requests.RequestException, ValueError, KeyError) as exc:
             log.warning(f"Ollama attempt {attempt}/4 failed: {exc}")
             if attempt < 4:
                 time.sleep(3)
 
-    log.error("All Ollama retries exhausted. Using empty enrichment.")
-    return {"summary": "", "tags": [], "inferred_title": title, "key_concepts": []}
+    return None
+
+
+def call_ollama(excerpt: str, title: str, word_count: int, cfg: dict) -> dict:
+    prompt = ENRICHMENT_PROMPT.format(title=title, word_count=word_count, excerpt=excerpt)
+    result = ollama_chat_json(prompt, cfg)
+    if result is None:
+        log.error("All Ollama retries exhausted. Using empty enrichment.")
+        return {"summary": "", "tags": [], "inferred_title": title, "key_concepts": []}
+    return result
 
 
 def call_claude_api(excerpt: str, title: str, word_count: int, cfg: dict) -> dict:
