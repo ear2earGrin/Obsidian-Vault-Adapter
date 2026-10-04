@@ -9,5 +9,8 @@ env/
 processed.json
 config.yaml
 
+# Files dropped on the web UI (copies of your exports and documents)
+uploads/
+
 # macOS
 .DS_Store

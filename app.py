@@ -9,7 +9,9 @@ Open: http://localhost:8080
 import asyncio
 import json
 import logging
+import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -21,7 +23,7 @@ from typing import AsyncGenerator
 import uvicorn
 import yaml
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 # ---------------------------------------------------------------------------
@@ -75,6 +77,34 @@ async def get_config():
             "split_word_threshold": cfg.get("split_word_threshold", 5000),
         }
     return {}
+
+
+UPLOAD_DIR = Path(__file__).resolve().parent / "uploads"
+
+
+@app.post("/upload")
+async def upload(request: Request, batch: str, name: str):
+    """
+    Receive one file dropped on the page. Browsers never reveal where a dropped
+    file lives on disk, so dropped files are copied into uploads/<batch>/ and
+    the run reads that folder. `name` may include subfolders from a dropped
+    folder; they are kept so same-named files don't collide.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", batch):
+        return JSONResponse({"error": "invalid batch id"}, status_code=400)
+    parts = [p for p in name.replace("\\", "/").split("/") if p]
+    if not parts or any(p in (".", "..") or p.startswith(".") for p in parts):
+        return JSONResponse({"error": f"invalid file name: {name}"}, status_code=400)
+
+    folder = UPLOAD_DIR / batch
+    dest = folder.joinpath(*parts)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".part")
+    with open(tmp, "wb") as f:
+        async for chunk in request.stream():
+            f.write(chunk)
+    os.replace(tmp, dest)
+    return {"folder": str(folder)}
 
 
 @app.post("/run")

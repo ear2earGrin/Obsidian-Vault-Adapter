@@ -428,18 +428,56 @@ def _reconstruct_messages(mapping: dict) -> list[dict]:
     return messages
 
 
+_CHATGPT_FILE = re.compile(r"^conversations(-\d+)?\.json$", re.IGNORECASE)
+
+
+def chatgpt_export_files(path: Path) -> list[Path]:
+    """
+    The JSON files that make up a ChatGPT export.
+
+    Older exports have one conversations.json; newer ones split the history
+    into conversations-000.json, conversations-001.json and so on. Accepts the
+    export folder (searched recursively), any one of the split files (its
+    siblings are included), or a single JSON file.
+    """
+    path = path.expanduser()
+    if path.is_file() and not re.match(r"^conversations-\d+\.json$", path.name, re.IGNORECASE):
+        return [path]
+    folder = path if path.is_dir() else path.parent
+    files = sorted(p for p in folder.rglob("*.json") if p.is_file() and _CHATGPT_FILE.match(p.name))
+    if not files:
+        raise FileNotFoundError(f"No conversations.json or conversations-NNN.json found in {folder}")
+    return files
+
+
 def parse_chatgpt_export(export_path: Path, min_words: int = 80) -> list[ExtractedDoc]:
     """
-    Parse a ChatGPT conversations.json export.
-    Returns one ExtractedDoc per conversation (skipping trivially short ones).
+    Parse a ChatGPT export: a folder, one of its conversations-NNN.json files,
+    or a single conversations.json. Returns one ExtractedDoc per conversation
+    (skipping trivially short ones), each conversation once even if it
+    appears in more than one file.
     """
-    log.info(f"Parsing ChatGPT export: {export_path.name}")
-
-    with open(export_path, encoding="utf-8") as f:
-        data = json.load(f)
-
-    if not isinstance(data, list):
-        raise ValueError("conversations.json must be a JSON array at the top level")
+    files = chatgpt_export_files(export_path)
+    data: list = []
+    seen: set[str] = set()
+    for file in files:
+        with open(file, encoding="utf-8") as f:
+            content = json.load(f)
+        if isinstance(content, dict) and isinstance(content.get("conversations"), list):
+            content = content["conversations"]
+        if not isinstance(content, list):
+            raise ValueError(f"{file.name} is not a list of conversations")
+        for conv in content:
+            if not isinstance(conv, dict):
+                continue
+            conv_id = str(conv.get("conversation_id") or conv.get("id") or "")
+            if conv_id and conv_id in seen:
+                continue
+            seen.add(conv_id)
+            data.append(conv)
+    names = files[0].name if len(files) == 1 else f"{len(files)} files ({files[0].name} … {files[-1].name})"
+    log.info(f"Parsing ChatGPT export: {names}, {len(data)} conversations")
+    export_path = files[0]
 
     docs: list[ExtractedDoc] = []
 
@@ -1059,7 +1097,8 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--source", help="Folder containing source documents (PDFs/DOCXs)")
-    parser.add_argument("--chatgpt", metavar="PATH", help="Path to ChatGPT conversations.json export")
+    parser.add_argument("--chatgpt", metavar="PATH",
+                        help="ChatGPT export folder, or its conversations.json / conversations-NNN.json")
     parser.add_argument("--vault", help="Obsidian vault root folder")
     parser.add_argument("--config", default="config.yaml", help="Path to config.yaml (default: config.yaml)")
     parser.add_argument("--dry-run", action="store_true", help="Scan and extract only — skip AI enrichment and writing")
