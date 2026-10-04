@@ -263,9 +263,10 @@ def _run_pipeline(job_id: str, cfg: dict, dry_run: bool, q: queue.Queue) -> None
                 return
             q.put({"type": "log", "level": "info", "msg": f"Parsing {chatgpt_path.name} ..."})
             all_convs = vb.parse_chatgpt_export(chatgpt_path)
-            items = [d for d in all_convs if vb.chatgpt_state_key(d) not in state]
+            items, in_state, in_vault = vb.new_chatgpt_conversations(all_convs, state, vault_path)
             q.put({"type": "log", "level": "info",
-                   "msg": f"{len(items)} new conversations ({len(all_convs) - len(items)} already processed)."})
+                   "msg": f"{len(items)} new conversations ({in_state} already processed, "
+                          f"{in_vault} already have a note in the vault)."})
         else:
             source_path = Path(cfg["source_path"]).expanduser().resolve()
             if not source_path.exists():

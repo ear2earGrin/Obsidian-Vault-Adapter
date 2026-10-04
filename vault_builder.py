@@ -544,6 +544,52 @@ def chatgpt_state_key(doc: ExtractedDoc) -> str:
     return hashlib.sha256(conv_id.encode()).hexdigest()
 
 
+_CHATGPT_SOURCE = re.compile(r'^source:\s*"?chatgpt__(.+?)\.chatgpt"?\s*$', re.MULTILINE)
+
+
+def existing_chatgpt_ids(vault: Path) -> set[str]:
+    """
+    Conversation IDs that already have a note anywhere in the vault.
+
+    Every ChatGPT note records `source: "chatgpt__<id>.chatgpt"` in its
+    frontmatter. Reading that catches conversations imported into a different
+    vault and later merged, or imported before processed.json was reset —
+    cases where processed.json alone would let them be written twice.
+    """
+    ids: set[str] = set()
+    for path in vault.rglob("*.md"):
+        if any(part.startswith(".") for part in path.relative_to(vault).parts):
+            continue
+        try:
+            with open(path, encoding="utf-8", errors="ignore") as f:
+                head = f.read(4096)
+        except OSError:
+            continue
+        if head.startswith("---"):
+            ids.update(m.group(1) for m in _CHATGPT_SOURCE.finditer(head))
+    return ids
+
+
+def new_chatgpt_conversations(
+    docs: list[ExtractedDoc], state: dict, vault: Path
+) -> tuple[list[ExtractedDoc], int, int]:
+    """
+    Drop conversations that were already processed (processed.json) or that
+    already have a note in the vault. Returns (new, in_state, already_in_vault).
+    """
+    existing = existing_chatgpt_ids(vault)
+    new: list[ExtractedDoc] = []
+    in_state = in_vault = 0
+    for doc in docs:
+        if chatgpt_state_key(doc) in state:
+            in_state += 1
+        elif doc.metadata.get("conversation_id") in existing:
+            in_vault += 1
+        else:
+            new.append(doc)
+    return new, in_state, in_vault
+
+
 # ---------------------------------------------------------------------------
 # Stage 3 — LM Studio AI enrichment
 # ---------------------------------------------------------------------------
@@ -1152,9 +1198,9 @@ def main() -> None:
             sys.exit(1)
         console.print(f"  Source : [cyan]{chatgpt_path}[/cyan] (ChatGPT export)")
         all_convs = parse_chatgpt_export(chatgpt_path)
-        # Filter already-processed conversations
-        chatgpt_docs = [d for d in all_convs if chatgpt_state_key(d) not in state]
-        log.info(f"{len(chatgpt_docs)} new conversations to process ({len(all_convs) - len(chatgpt_docs)} already done).")
+        chatgpt_docs, in_state, in_vault = new_chatgpt_conversations(all_convs, state, vault_path)
+        log.info(f"{len(chatgpt_docs)} new conversations to process "
+                 f"({in_state} already processed, {in_vault} already have a note in the vault).")
         queue: list[Path] = []
     else:
         if not cfg.get("source_path"):
